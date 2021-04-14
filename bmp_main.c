@@ -28,10 +28,10 @@ struct __attribute__ ((packed)) BITMAPINFO {
 typedef struct BITMAPINFO BITMAPINFO;
 
 struct ARGB {
-  uint8_t ALPHA;
-  uint8_t RED;
-  uint8_t GREEN;
   uint8_t BLUE;
+  uint8_t GREEN;
+  uint8_t RED;
+  uint8_t ALPHA;
 };
 typedef struct ARGB ARGB;
 
@@ -67,6 +67,7 @@ void read_pixel(float* A_adr, float* R_adr, float* G_adr, float* B_adr, ARGB* pi
 }
 
 int main(int argc, char* argv[]) {
+  printf("NEW)");
   if (argc < 3) {
     return 1;
   }
@@ -91,6 +92,7 @@ int main(int argc, char* argv[]) {
   fread(&BH_back, sizeof(BH_back), 1, back);
   fread(&BI_back, sizeof(BI_back), 1, back);
 
+
   fseek(back, 0, SEEK_END);
   size_t sz = ftell(back);
   fseek(back, 0, SEEK_SET);
@@ -111,7 +113,8 @@ int main(int argc, char* argv[]) {
   int width = BI_back.biWidth;
   int height = BI_back.biHeight;
 
-  int wh_8x = closet_8x(width * height);
+  int wh = width * height;
+  int wh_8x = closet_8x(wh);
 
   float* A_back = (float*)aligned_alloc(32, sizeof(float) * 8 * 12);
   float* R_back = A_back + 8;
@@ -130,15 +133,15 @@ int main(int argc, char* argv[]) {
 
   ARGB argb_back;
   ARGB argb_front;
-
-  fseek(res, BH_back.bfOffBits, SEEK_SET);
   ARGB argb_res;
 
-  for (int i = 0; i < wh_8x; ++i) {
-    read_pixel(A_front, R_front, G_front, B_front, &argb_front, front);
-    read_pixel(A_back, R_back, G_back, B_back, &argb_back, back);
+  fseek(res, BH_back.bfOffBits, SEEK_SET);
 
-    if (i % 8 == 0) {
+  for(int i = 0; i < wh_8x; ++i) {
+    read_pixel(A_front +  (i % 8), R_front + (i % 8), G_front + (i % 8), B_front + (i % 8), &argb_front, front);
+    read_pixel(A_back + (i % 8), R_back + (i % 8), G_back + (i % 8), B_back + (i % 8), &argb_back, back);
+
+    if (i % 8 == 7) {
       __m256 A_back_m256 = _mm256_load_ps(A_back);
       __m256 A_front_m256 = _mm256_load_ps(A_front);
 
@@ -152,7 +155,9 @@ int main(int argc, char* argv[]) {
       calc_pixel_color(G_res, G_front, G_back, A_res_m256, A_front_m256, A_back_m256);
       calc_pixel_color(B_res, B_front, B_back, A_res_m256, A_front_m256, A_back_m256);
 
-      for(int j = 0; j < 8; ++j) {
+      int write_count = (8) * (8 <= wh - i) + (wh - i) * (8 > wh - i);
+      
+      for(int j = 0; j < write_count ; ++j) {
         argb_res.ALPHA = (uint8_t)(A_res[j] * 255);
         argb_res.RED   = (uint8_t)(R_res[j] * 255);
         argb_res.GREEN = (uint8_t)(G_res[j] * 255);
