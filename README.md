@@ -6,6 +6,6 @@
 
 ## Usage
 
-#### `>>>gcc bmp_main.c -o prog -mavx`
-#### `>>>./prog [background.bmp] [foreground.bmp] [res_name.bmp]`
+#### `>>> gcc bmp_main.c -o prog -mavx`
+#### `>>> ./prog [background.bmp] [foreground.bmp] [res_name.bmp]`
 ---
