@@ -3,6 +3,31 @@
 #include <string.h>
 #include <immintrin.h>
 
+#include <time.h>
+#include <stdatomic.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+const char* log_prefix(const char* func, int line) {
+  struct timespec spec; clock_gettime(CLOCK_REALTIME, &spec);
+  long long current_msec = spec.tv_sec * 1000L + spec.tv_nsec / 1000000;
+  static _Atomic long long start_msec_storage = -1;
+  long long start_msec = -1;
+  if (atomic_compare_exchange_strong(&start_msec_storage, &start_msec, current_msec))
+    start_msec = current_msec;
+  long long delta_msec = current_msec - start_msec;
+  const int max_func_len = 10;
+  static __thread char prefix[100];
+  sprintf(prefix, "%lld.%03lld %*s():%d    ", delta_msec / 1000, delta_msec % 1000, max_func_len, func, line);
+  sprintf(prefix + max_func_len + 13, "[tid=%ld]", syscall(__NR_gettid));
+  return prefix;
+}
+#define log_printf_impl(fmt, ...) { time_t t = time(0); dprintf(2, "%s: " fmt "%s", log_prefix(__FUNCTION__, __LINE__), __VA_ARGS__); }
+// Format: <time_since_start> <func_name>:<line> : <custom_message>
+#define log_printf(...) log_printf_impl(__VA_ARGS__, "")
+#define SWAP(a, b) { __typeof__(a) c = (a); (a) = (b); (b) = (c); }
+
+#define BUFFER_CAPACITY 4096
+
 struct __attribute__ ((packed)) BITMAPFILEHEADER {
   uint16_t bfType;
   uint32_t bfSize;
@@ -35,7 +60,7 @@ struct ARGB {
 };
 typedef struct ARGB ARGB;
 
-int closet_8x(int x) {
+uint32_t closet_8x(uint32_t x) {
   if ((x % 8) == 0) {
     return x;
   }
@@ -58,27 +83,78 @@ void calc_pixel_color(float* res_adr, float* front_adr, float* back_adr, __m256 
   _mm256_store_ps(res_adr, res_color);
 }
 
-void read_pixel(float* A_adr, float* R_adr, float* G_adr, float* B_adr, ARGB* pixel, FILE* src){
-  fread(pixel, sizeof(ARGB), 1, src);
-  *A_adr = (float)(pixel->ALPHA / 255.0);
-  *R_adr = (float)(pixel->RED / 255.0);
-  *G_adr = (float)(pixel->GREEN / 255.0);
-  *B_adr = (float)(pixel->BLUE / 255.0);
+void read_pixels(float* A_adr, float* R_adr, float* G_adr, float* B_adr, FILE* src) {
+  ARGB buf[BUFFER_CAPACITY];
+  fread(buf, sizeof(ARGB), BUFFER_CAPACITY, src);
+
+  for (int i = 0; i < BUFFER_CAPACITY; ++i) {
+    A_adr[i] = (float)(buf[i].ALPHA / 255.0);
+    R_adr[i] = (float)(buf[i].RED / 255.0);
+    G_adr[i] = (float)(buf[i].GREEN / 255.0);
+    B_adr[i] = (float)(buf[i].BLUE / 255.0);
+  }
+}
+
+void copy_file(FILE* src, FILE* dst) {
+  fseek(src, 0, SEEK_END);
+  size_t sz = ftell(src);
+  fseek(src, 0, SEEK_SET);
+  uint8_t* buf = malloc(sz);
+  fread(buf, sz, 1, src);
+  fwrite(buf, sz, 1, dst);
+  free(buf);
+}
+
+void full_calc_8pix(
+    float* A_res,   float* R_res,   float* G_res,   float* B_res,
+    float* A_front, float* R_front, float* G_front, float* B_front,
+    float* A_back,  float* R_back,  float* G_back,  float* B_back
+    ) {
+  __m256 A_back_m256 = _mm256_load_ps(A_back);
+  __m256 A_front_m256 = _mm256_load_ps(A_front);
+  __m256 A_mul_m256 = _mm256_mul_ps(A_back_m256, A_front_m256);
+  __m256 A_sum_m256 = _mm256_add_ps(A_back_m256, A_front_m256);
+  __m256 A_res_m256 = _mm256_sub_ps(A_sum_m256, A_mul_m256);
+
+  _mm256_store_ps(A_res, A_res_m256);
+  calc_pixel_color(R_res, R_front, R_back, A_res_m256, A_front_m256, A_back_m256);
+  calc_pixel_color(G_res, G_front, G_back, A_res_m256, A_front_m256, A_back_m256);
+  calc_pixel_color(B_res, B_front, B_back, A_res_m256, A_front_m256, A_back_m256);
 }
 
 int main(int argc, char* argv[]) {
-  printf("NEW)");
+  log_printf("Program started\n");
+
+  //uint32_t numCPU = sysconf(_SC_NPROCESSORS_ONLN);
+  //printf("PROCESSORS COUNT: %d", numCPU);
+
   if (argc < 3) {
+    perror("Not enough arguments.");
     return 1;
   }
 
   FILE* back = fopen(argv[1], "rb");
-  FILE* front = fopen(argv[2], "rb");
-  FILE* res = fopen(argv[3], "wb");
 
-  if (back == NULL || front == NULL || res == NULL) {
+  if (back == NULL) {
+    perror("Background image failed to open.");
     return 2;
   }
+
+  FILE* front = fopen(argv[2], "rb");
+
+  if (front == NULL) {
+    perror("Foreground image failed to open.");
+    return 2;
+  }
+
+  FILE* result = fopen(argv[3], "wb");
+
+  if (result == NULL) {
+    perror("Resulting image failed to open/create.");
+    return 2;
+  }
+
+  log_printf("All files opened\n");
 
   BITMAPFILEHEADER BH_front;
   BITMAPINFO BI_front;
@@ -92,86 +168,92 @@ int main(int argc, char* argv[]) {
   fread(&BH_back, sizeof(BH_back), 1, back);
   fread(&BI_back, sizeof(BI_back), 1, back);
 
+  copy_file(back, result);
 
-  fseek(back, 0, SEEK_END);
-  size_t sz = ftell(back);
-  fseek(back, 0, SEEK_SET);
-  uint8_t* buf = malloc(sz);
-  fread(buf, sz, 1, back);
-  fwrite(buf, sz, 1, res);
-
-  fseek(back, BH_back.bfOffBits, SEEK_SET);
   fseek(front, BH_front.bfOffBits, SEEK_SET);
+  fseek(back, BH_back.bfOffBits, SEEK_SET);
+  fseek(result, BH_back.bfOffBits, SEEK_SET);
 
-  if(BI_back.biWidth != BI_front.biWidth || BI_back.biHeight != BI_front.biHeight) {
+  if (BI_back.biWidth != BI_front.biWidth || BI_back.biHeight != BI_front.biHeight) {
+    perror("Images have different resolutions.");
     fclose(back);
     fclose(front);
-    fclose(res);
+    fclose(result);
     return 3;
   }
 
-  int width = BI_back.biWidth;
-  int height = BI_back.biHeight;
+  uint32_t width = BI_back.biWidth;
+  uint32_t height = BI_back.biHeight;
 
-  int wh = width * height;
-  int wh_8x = closet_8x(wh);
+  uint32_t wh = width * height;
+  uint32_t wh_8x = closet_8x(wh);
 
-  float* A_back = (float*)aligned_alloc(32, sizeof(float) * 8 * 12);
-  float* R_back = A_back + 8;
-  float* G_back = R_back + 8;
-  float* B_back = G_back + 8;
+  log_printf("Allocating started\n");
 
-  float* A_front = B_back + 8;
-  float* R_front = A_front + 8;
-  float* G_front = R_front + 8;
-  float* B_front = G_front + 8;
+  float* A_back = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* R_back = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* G_back = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* B_back = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
 
-  float* A_res = B_front + 8;
-  float* R_res = A_res + 8;
-  float* G_res = R_res + 8;
-  float* B_res = G_res + 8;
+  float* A_front = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* R_front = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* G_front = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* B_front = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
 
-  ARGB argb_back;
-  ARGB argb_front;
-  ARGB argb_res;
+  float* A_res = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* R_res = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* G_res = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
+  float* B_res = (float*)aligned_alloc(32, sizeof(float) * BUFFER_CAPACITY);
 
-  fseek(res, BH_back.bfOffBits, SEEK_SET);
+  log_printf("Allocating finished\n");
 
-  for(int i = 0; i < wh_8x; ++i) {
-    read_pixel(A_front +  (i % 8), R_front + (i % 8), G_front + (i % 8), B_front + (i % 8), &argb_front, front);
-    read_pixel(A_back + (i % 8), R_back + (i % 8), G_back + (i % 8), B_back + (i % 8), &argb_back, back);
+  ARGB res_buffer[BUFFER_CAPACITY];
 
-    if (i % 8 == 7) {
-      __m256 A_back_m256 = _mm256_load_ps(A_back);
-      __m256 A_front_m256 = _mm256_load_ps(A_front);
+  for(int i = 0; i < wh_8x; i += BUFFER_CAPACITY) {
+    read_pixels(A_front, R_front, G_front, B_front, front);
+    read_pixels(A_back, R_back, G_back, B_back, back);
 
-      __m256 A_mul_m256 = _mm256_mul_ps(A_back_m256, A_front_m256);
-      __m256 A_sum_m256 = _mm256_add_ps(A_back_m256, A_front_m256);
-      __m256 A_res_m256 = _mm256_sub_ps(A_sum_m256, A_mul_m256);
-
-      _mm256_store_ps(A_res, A_res_m256);
-
-      calc_pixel_color(R_res, R_front, R_back, A_res_m256, A_front_m256, A_back_m256);
-      calc_pixel_color(G_res, G_front, G_back, A_res_m256, A_front_m256, A_back_m256);
-      calc_pixel_color(B_res, B_front, B_back, A_res_m256, A_front_m256, A_back_m256);
-
-      int write_count = (8) * (8 <= wh - i) + (wh - i) * (8 > wh - i);
-      
-      for(int j = 0; j < write_count ; ++j) {
-        argb_res.ALPHA = (uint8_t)(A_res[j] * 255);
-        argb_res.RED   = (uint8_t)(R_res[j] * 255);
-        argb_res.GREEN = (uint8_t)(G_res[j] * 255);
-        argb_res.BLUE  = (uint8_t)(B_res[j] * 255);
-
-        fwrite(&argb_res, sizeof(ARGB), 1, res);
-      }
+    for (int j = 0; j < BUFFER_CAPACITY; j += 8) {
+      full_calc_8pix(
+          A_res + j,   R_res + j,   G_res + j,   B_res + j,
+          A_front + j, R_front + j, G_front + j, B_front + j,
+          A_back + j,  R_back + j,  G_back + j,  B_back + j
+          );
     }
+
+    ARGB argb_res;
+
+    for (int j = 0; j < BUFFER_CAPACITY; ++j) {
+      argb_res.ALPHA = (uint8_t)(A_res[j] * 255);
+      argb_res.RED   = (uint8_t)(R_res[j] * 255);
+      argb_res.GREEN = (uint8_t)(G_res[j] * 255);
+      argb_res.BLUE  = (uint8_t)(B_res[j] * 255);
+
+      res_buffer[j] = argb_res;
+    }
+
+    fwrite(res_buffer, sizeof(ARGB), BUFFER_CAPACITY, result);
   }
 
   free(A_back);
+  free(R_back);
+  free(G_back);
+  free(B_back);
+
+  free(A_front);
+  free(R_front);
+  free(G_front);
+  free(B_front);
+
+  free(A_res);
+  free(R_res);
+  free(G_res);
+  free(B_res);
 
   fclose(back);
   fclose(front);
-  fclose(res);
+  fclose(result);
+
+  log_printf("Program finished\n");
   return 0;
 }
