@@ -9,6 +9,6 @@ gcc bmp_main.c -o prog -mavx
 ```
 
 ```sh
-./prog [background.bmp] [foreground.bmp] [res_name.bmp]
+./prog background foreground result_name
 ```
 ---
